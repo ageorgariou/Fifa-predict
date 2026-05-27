@@ -1,0 +1,26 @@
+# Secrets
+.env
+.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+.venv/
+venv/
+env/
+.pytest_cache/
+
+# Caches / data artifacts
+.cache/
+*.sqlite
+*.db
+data/cache/
+data/backtest_scatter.png
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/
+*.swp

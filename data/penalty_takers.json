@@ -1,0 +1,14 @@
+[
+  {"name": "Kylian Mbappé", "team": "France"},
+  {"name": "Harry Kane", "team": "England"},
+  {"name": "Bruno Fernandes", "team": "Portugal"},
+  {"name": "Cristiano Ronaldo", "team": "Portugal"},
+  {"name": "Lionel Messi", "team": "Argentina"},
+  {"name": "Mohamed Salah", "team": "Egypt"},
+  {"name": "Erling Haaland", "team": "Norway"},
+  {"name": "Romelu Lukaku", "team": "Belgium"},
+  {"name": "Memphis Depay", "team": "Netherlands"},
+  {"name": "Luka Modrić", "team": "Croatia"},
+  {"name": "Lautaro Martínez", "team": "Argentina"},
+  {"name": "Vinícius Júnior", "team": "Brazil"}
+]
