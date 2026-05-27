@@ -72,6 +72,31 @@ HIGH_VAR_TIEBREAK = 0.5     # see captain_optimizer.TIEBREAK_EV_WINDOW
 KNOCKOUT_MDS = (4, 5, 6, 7, 8)
 QUAL_BOOSTER_BONUS = 2.0    # +2 per XI player whose team advances
 
+# --- Recommendation thresholds (added 2026-05) ----------------------------
+# Wildcard, 12th Man, and Maximum Captain are season-defining one-shots: a
+# single +30-50 pt window is worth far more than the sum of "fine" +5-10 pt
+# uses. So we refuse to spend them on weak slots and prefer HOLD instead.
+#
+# MD1 is treated even more conservatively because everyone has full chip
+# inventory, the field's captain choices are obvious (Kane/Mbappé/Yamal),
+# and there's a full 7 matchdays of better options ahead.
+HOLD_CHIPS = {"Wildcard", "12th Man", "Maximum Captain"}
+MIN_LIFT_DEFAULT = 15.0
+MIN_LIFT_MD1 = 20.0
+N_ALTERNATIVES_TO_SHOW = 3
+
+# Late-MD bias: 12th Man and Maximum Captain have higher ceilings in
+# knockout rounds (deeper bench rotations + variance-friendly elimination
+# matches), so we add a small per-MD lift to the *ranking* score. The
+# reported `expected_lift` stays the raw model number — the bias only
+# affects which MD is chosen.
+LATE_MD_BIAS_CHIPS = {"12th Man", "Maximum Captain"}
+LATE_MD_BIAS_PER_MD = 1.5
+
+
+def _min_lift_for(md: int) -> float:
+    return MIN_LIFT_MD1 if md == 1 else MIN_LIFT_DEFAULT
+
 
 def _wildcard_lift_for_md(
     ev: pd.DataFrame,
@@ -179,86 +204,168 @@ def recommend_chip_sequence(
     md_used: set[int] = set()
 
     # Pre-score every (chip, md) combination so we can do greedy selection.
+    # `lift` is the raw model number; `score` is `lift` plus the late-MD
+    # bias when applicable, and is what we sort by.
     scores: dict[tuple[str, int], dict] = {}
     for md in matchdays:
         # Wildcard
         lift, _ = _wildcard_lift_for_md(ev, squad, md)
-        scores[("Wildcard", md)] = {"lift": lift, "reasoning":
-            f"MD{md} re-optimization under nation cap "
-            f"{NATION_CAP[STAGE_BY_MD[md]]} adds {lift:.1f} pts."}
+        scores[("Wildcard", md)] = {
+            "lift": lift, "score": lift, "extra": {},
+            "base_reasoning":
+                f"re-optimization under nation cap "
+                f"{NATION_CAP[STAGE_BY_MD[md]]} adds +{lift:.1f} pts",
+        }
 
-        # 12th Man
+        # 12th Man — late-MD biased
         lift, alt = _twelfth_man_lift_for_md(ev, squad, md)
         scores[("12th Man", md)] = {
             "lift": lift,
-            "reasoning": f"Best non-squad player MD{md}: "
-                         f"{alt or '(none)'} (+{lift:.1f}).",
+            "score": lift + LATE_MD_BIAS_PER_MD * (md - 1),
+            "base_reasoning": (
+                f"best non-squad player is {alt or '(none)'} "
+                f"(+{lift:.1f})"
+            ),
             "extra": {"best_alt_player": alt},
         }
 
-        # Max Captain — NEVER MD1
+        # Max Captain — NEVER MD1, and late-MD biased
         if md == 1:
             scores[("Maximum Captain", md)] = {
-                "lift": 0.0,
-                "reasoning": "MD1: the field obviously triples Kane/Mbappé/"
-                             "Yamal. Save the chip.",
+                "lift": 0.0, "score": -1e9,    # ensure never picked
+                "base_reasoning": (
+                    "the field obviously triples Kane/Mbappé/Yamal; "
+                    "the chip's edge collapses"
+                ),
+                "extra": {},
             }
         else:
             lift, n_close = _max_captain_lift_for_md(squad, md)
-            # Variance bonus: more close candidates = higher ceiling.
-            var_bonus = max(0, n_close - 1) * 0.5
+            var_bonus = max(0, n_close - 1) * 0.5    # variance bonus
             scores[("Maximum Captain", md)] = {
                 "lift": round(lift + var_bonus, 2),
-                "reasoning": (
-                    f"MD{md} top XI EV = {lift:.1f}, "
-                    f"{n_close} candidates within {HIGH_VAR_TIEBREAK} EV."
+                "score": round(lift + var_bonus
+                                + LATE_MD_BIAS_PER_MD * (md - 1), 2),
+                "base_reasoning": (
+                    f"top XI EV = {lift:.1f} pts, "
+                    f"{n_close} captain candidates within "
+                    f"{HIGH_VAR_TIEBREAK} EV"
                 ),
+                "extra": {},
             }
 
         # Qualification Booster — only meaningful R32 onward
         if md in KNOCKOUT_MDS:
             lift = _qual_booster_lift_for_md(squad, sim_summary, md)
             scores[("Qualification Booster", md)] = {
-                "lift": lift,
-                "reasoning": (
-                    f"MD{md} aggregate XI progression bonus = +{lift:.1f}."
-                ),
+                "lift": lift, "score": lift, "extra": {},
+                "base_reasoning":
+                    f"aggregate XI progression bonus = +{lift:.1f} pts",
             }
         else:
             scores[("Qualification Booster", md)] = {
-                "lift": 0.0,
-                "reasoning": "Not available in group stage.",
+                "lift": 0.0, "score": -1e9,
+                "base_reasoning": "not available in group stage",
+                "extra": {},
             }
 
+    def _alt_str(chip: str, exclude_md: int | None = None,
+                  exclude_used: bool = True) -> str:
+        """Compact ranked list of alternative MDs for a chip's reasoning."""
+        rows = []
+        for md in matchdays:
+            if md == exclude_md:
+                continue
+            if exclude_used and md in md_used:
+                continue
+            s = scores.get((chip, md))
+            if s is None or s["score"] < -1e8:
+                continue
+            rows.append((md, s["lift"]))
+        rows.sort(key=lambda kv: kv[1], reverse=True)
+        rows = rows[:N_ALTERNATIVES_TO_SHOW]
+        if not rows:
+            return "(no viable alternatives)"
+        return ", ".join(f"MD{md}: +{lift:.1f}" for md, lift in rows)
+
     # Greedy assignment per chip.
+    #
+    # Two-step rule for HOLD_CHIPS:
+    #   1. Threshold gate uses RAW lift — at least one slot must clear
+    #      the per-MD threshold (15, or 20 for MD1) for the chip to be
+    #      considered for assignment.
+    #   2. Among the slots that clear the gate, pick the one with the
+    #      highest BIASED score. The bias rewards knockout rounds for
+    #      chips whose ceiling is higher there (12th Man, Max Captain).
+    #
+    # Other chips (Qualification Booster) bypass the threshold and use
+    # raw lift directly.
     for chip in chips_available:
         if chip == "Mystery Booster":
             plan.append({
-                "matchday": None,
-                "chip": chip,
-                "expected_lift": 0.0,
-                "reasoning": "Hold until revealed by FIFA.",
-                "extra": {},
+                "matchday": None, "chip": chip, "expected_lift": 0.0,
+                "reasoning": "Hold until revealed by FIFA.", "extra": {},
             })
             continue
+
         candidates = [
             (md, scores[(chip, md)])
             for md in matchdays
             if md not in md_used and (chip, md) in scores
+            and scores[(chip, md)]["score"] > -1e8
         ]
         if not candidates:
+            plan.append({
+                "matchday": None, "chip": chip, "expected_lift": 0.0,
+                "reasoning": "Hold — no viable slot remaining.", "extra": {},
+            })
             continue
-        best_md, best = max(candidates, key=lambda kv: kv[1]["lift"])
+
+        if chip in HOLD_CHIPS:
+            # Step 1: threshold gate on raw lift.
+            viable = [
+                (md, s) for md, s in candidates
+                if s["lift"] >= _min_lift_for(md)
+            ]
+            if not viable:
+                # No slot crosses the bar — HOLD, and report the best raw-lift
+                # slot so the user can see how far short we are.
+                best_md, best = max(candidates, key=lambda kv: kv[1]["lift"])
+                threshold = _min_lift_for(best_md)
+                alts = _alt_str(chip, exclude_md=best_md)
+                plan.append({
+                    "matchday": None,
+                    "chip": chip,
+                    "expected_lift": best["lift"],
+                    "reasoning": (
+                        f"Hold — best slot is MD{best_md} at only "
+                        f"+{best['lift']:.1f} pts (need ≥{threshold:.0f} pts; "
+                        f"{best['base_reasoning']}). Other slots: {alts}."
+                    ),
+                    "extra": best.get("extra", {}),
+                })
+                continue
+            # Step 2: among viable slots, pick highest BIASED score.
+            best_md, best = max(viable, key=lambda kv: kv[1]["score"])
+        else:
+            # Non-hold chips (Qualification Booster) just take max raw lift.
+            best_md, best = max(candidates, key=lambda kv: kv[1]["lift"])
+
+        alts = _alt_str(chip, exclude_md=best_md)
         plan.append({
             "matchday": best_md,
             "chip": chip,
             "expected_lift": best["lift"],
-            "reasoning": best["reasoning"],
+            "reasoning": (
+                f"MD{best_md} is the highest-lift slot at "
+                f"+{best['lift']:.1f} pts ({best['base_reasoning']}). "
+                f"Alternatives considered: {alts}."
+            ),
             "extra": best.get("extra", {}),
         })
         md_used.add(best_md)
 
-    # Sort by matchday (Mystery last)
+    # Sort by matchday (HOLDs / Mystery last).
     plan.sort(key=lambda p: (p["matchday"] is None, p["matchday"] or 99))
     return plan
 

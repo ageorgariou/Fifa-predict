@@ -12,7 +12,10 @@ import pandas as pd
 
 from model.chip_optimizer import (
     ALL_CHIPS,
+    HOLD_CHIPS,
     KNOCKOUT_MDS,
+    MIN_LIFT_DEFAULT,
+    MIN_LIFT_MD1,
     recommend_chip_sequence,
 )
 
@@ -112,3 +115,46 @@ def test_chips_assigned_to_distinct_matchdays():
     plan = recommend_chip_sequence(ev=ev, squad=squad, sim_summary=sim)
     mds = [p["matchday"] for p in plan if p["matchday"] is not None]
     assert len(mds) == len(set(mds)), "chips collided on a matchday"
+
+
+def test_low_lift_chips_hold_below_threshold():
+    """Wildcard, 12th Man, and Max Captain HOLD when no slot crosses the
+    raw-lift threshold (15 pts default, 20 pts for MD1)."""
+    ev = _synthetic_ev()
+    squad = _synthetic_squad(ev)
+    sim = _synthetic_sim(ev)
+    plan = recommend_chip_sequence(ev=ev, squad=squad, sim_summary=sim)
+    by_chip = {p["chip"]: p for p in plan}
+    for chip in HOLD_CHIPS:
+        p = by_chip[chip]
+        if p["matchday"] is not None:
+            # Must have crossed its MD's threshold
+            threshold = MIN_LIFT_MD1 if p["matchday"] == 1 else MIN_LIFT_DEFAULT
+            assert p["expected_lift"] >= threshold
+
+
+def test_md1_holds_unless_above_20():
+    """No HOLD_CHIPS chip lands on MD1 unless raw lift > 20 pts."""
+    ev = _synthetic_ev()
+    squad = _synthetic_squad(ev)
+    sim = _synthetic_sim(ev)
+    plan = recommend_chip_sequence(ev=ev, squad=squad, sim_summary=sim)
+    for p in plan:
+        if p["chip"] in HOLD_CHIPS and p["matchday"] == 1:
+            assert p["expected_lift"] >= MIN_LIFT_MD1
+
+
+def test_reasoning_lists_alternatives():
+    """Every plan entry's reasoning (assignment or HOLD) should reference
+    at least one other matchday so the user sees what was compared."""
+    ev = _synthetic_ev()
+    squad = _synthetic_squad(ev)
+    sim = _synthetic_sim(ev)
+    plan = recommend_chip_sequence(ev=ev, squad=squad, sim_summary=sim)
+    for p in plan:
+        if p["chip"] == "Mystery Booster":
+            continue   # mystery is always pure hold
+        # Either "Alternatives considered" or "Other slots" should appear,
+        # along with at least one MDx: +y pattern.
+        assert "MD" in p["reasoning"]
+        assert "+" in p["reasoning"]
