@@ -1,8 +1,17 @@
-"""FBref club-season stats via soccerdata.
+"""FBref club-season stats.
 
-Pulls last completed club season (default 2025-2026) for the Big 5 European
-leagues, combines four stat types — standard + shooting + misc for outfielders
-and keeper for goalkeepers — and caches the merged frame for 7 days.
+Production path: load from static CSVs shipped in the repo at
+`data/fbref_cache/big5_<season>.csv` (outfield) and
+`big5_<season>_gk.csv`. Last-season stats don't change during the WC, so
+the deployed app doesn't need to invoke `soccerdata` / chromedriver at all.
+
+Refresh path (local-only): run `python -m data.fbref_stats refresh` to
+re-scrape from FBref via soccerdata and rewrite the static CSVs. Do this
+once before pushing changes to GitHub if a new club season has completed.
+
+The original soccerdata pipeline used the Big 5 leagues' standard + shooting +
+misc tables for outfielders and the keeper table for goalkeepers, merged
+on (league, season, team, player). Limitations of the player-season feeds:
 
 Soccerdata 1.9.0 limitation
 ---------------------------
@@ -35,12 +44,12 @@ from __future__ import annotations
 
 import logging
 import unicodedata
+from pathlib import Path
 
 import numpy as np
 import pandas as pd
-import soccerdata as sd
 
-from config import TTL_FBREF
+from config import DATA_DIR, TTL_FBREF
 from data.cache import cache_get, cache_set
 
 log = logging.getLogger(__name__)
@@ -48,6 +57,16 @@ log = logging.getLogger(__name__)
 DEFAULT_LEAGUES = "Big 5 European Leagues Combined"
 DEFAULT_SEASON = "2025-2026"
 _INDEX_COLS = ["league", "season", "team", "player"]
+
+# Static CSV cache shipped in the repo. The deployed app reads from these
+# directly — no soccerdata / chromedriver dependency in production.
+STATIC_CACHE_DIR = DATA_DIR / "fbref_cache"
+
+
+def _csv_path(season: str, gk: bool) -> Path:
+    slug = season.replace("-", "_")
+    suffix = "_gk" if gk else ""
+    return STATIC_CACHE_DIR / f"big5_{slug}{suffix}.csv"
 
 
 def _flatten(df: pd.DataFrame) -> pd.DataFrame:
@@ -75,19 +94,16 @@ def _pick(df: pd.DataFrame, keep: dict[str, str]) -> pd.DataFrame:
 
 
 def _read_stat_type(season: str, stat_type: str) -> pd.DataFrame:
+    """Lazy-imports soccerdata so the deployed app (which never hits this
+    path) doesn't carry the chromedriver dependency at import time."""
+    import soccerdata as sd
     fbref = sd.FBref(leagues=DEFAULT_LEAGUES, seasons=season)
     return _flatten(fbref.read_player_season_stats(stat_type=stat_type))
 
 
-def fetch_outfield_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
-    """One row per outfield player with per-90 metrics the projection formula
-    needs. See module docstring for column meanings and proxy notes."""
-    key = f"fbref:outfield:{DEFAULT_LEAGUES}:{season}"
-    cached = cache_get(key, TTL_FBREF)
-    if cached is not None:
-        return cached
-
-    log.info("FBref fetch: outfield stats for %s (cold cache ~1-3 min)", season)
+def _scrape_outfield(season: str) -> pd.DataFrame:
+    """Re-scrape outfield stats via soccerdata. Used by refresh_static_cache."""
+    log.info("Scraping outfield stats for %s via soccerdata (~1-3 min)", season)
     std = _read_stat_type(season, "standard")
     sho = _read_stat_type(season, "shooting")
     msc = _read_stat_type(season, "misc")
@@ -147,18 +163,12 @@ def fetch_outfield_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
     ]:
         merged[p90_col] = pd.to_numeric(merged[total_col], errors="coerce") / nineties
 
-    cache_set(key, merged)
     return merged
 
 
-def fetch_gk_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
-    """One row per goalkeeper: saves, save%, CS, CS/90, GA, GA/90."""
-    key = f"fbref:gk:{DEFAULT_LEAGUES}:{season}"
-    cached = cache_get(key, TTL_FBREF)
-    if cached is not None:
-        return cached
-
-    log.info("FBref fetch: GK stats for %s (cold cache ~30-60s)", season)
+def _scrape_gk(season: str) -> pd.DataFrame:
+    """Re-scrape GK stats via soccerdata. Used by refresh_static_cache."""
+    log.info("Scraping GK stats for %s via soccerdata (~30-60s)", season)
     gk = _read_stat_type(season, "keeper")
 
     gk_pick = _pick(gk, {
@@ -188,8 +198,67 @@ def fetch_gk_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
     gk_pick["per90_saves"] = pd.to_numeric(gk_pick["saves"], errors="coerce") / nineties
     gk_pick["per90_cs"] = pd.to_numeric(gk_pick["clean_sheets"], errors="coerce") / nineties
 
-    cache_set(key, gk_pick)
     return gk_pick
+
+
+# ---------------------------------------------------------------------------
+# Public API: CSV-first loaders + refresh CLI
+# ---------------------------------------------------------------------------
+
+def _load_csv_or_scrape(season: str, gk: bool) -> pd.DataFrame:
+    """Returns the requested stats frame. Tries CSV first, falls back to
+    soccerdata scrape (with a warning), then writes the result back to CSV
+    so future runs are fast and don't need chromedriver."""
+    csv = _csv_path(season, gk)
+    if csv.exists():
+        return pd.read_csv(csv)
+    log.warning(
+        "%s missing — falling back to soccerdata scrape. "
+        "Run `python -m data.fbref_stats refresh` to populate it.", csv
+    )
+    df = _scrape_gk(season) if gk else _scrape_outfield(season)
+    csv.parent.mkdir(parents=True, exist_ok=True)
+    df.to_csv(csv, index=False)
+    return df
+
+
+def fetch_outfield_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
+    """One row per outfield player with per-90 metrics. Loads from the
+    static CSV shipped in the repo; no chromedriver dependency in prod."""
+    key = f"fbref:outfield:{DEFAULT_LEAGUES}:{season}"
+    cached = cache_get(key, TTL_FBREF)
+    if cached is not None:
+        return cached
+    df = _load_csv_or_scrape(season, gk=False)
+    cache_set(key, df)
+    return df
+
+
+def fetch_gk_stats(season: str = DEFAULT_SEASON) -> pd.DataFrame:
+    """One row per goalkeeper: saves, save%, CS, CS/90, GA, GA/90."""
+    key = f"fbref:gk:{DEFAULT_LEAGUES}:{season}"
+    cached = cache_get(key, TTL_FBREF)
+    if cached is not None:
+        return cached
+    df = _load_csv_or_scrape(season, gk=True)
+    cache_set(key, df)
+    return df
+
+
+def refresh_static_cache(season: str = DEFAULT_SEASON) -> None:
+    """Local-only: re-scrape via soccerdata and rewrite the static CSVs.
+    Requires Chrome / chromedriver on the host machine. Run before pushing
+    when a new club season has completed."""
+    STATIC_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    out = _scrape_outfield(season)
+    out_path = _csv_path(season, gk=False)
+    out.to_csv(out_path, index=False)
+    log.info("Wrote %d outfield rows to %s", len(out), out_path)
+
+    gk = _scrape_gk(season)
+    gk_path = _csv_path(season, gk=True)
+    gk.to_csv(gk_path, index=False)
+    log.info("Wrote %d GK rows to %s", len(gk), gk_path)
 
 
 def _fold(s: str) -> str:
@@ -212,8 +281,16 @@ def stats_for_player(name: str, df: pd.DataFrame | None = None) -> dict | None:
 
 
 if __name__ == "__main__":
+    import sys
+    if len(sys.argv) > 1 and sys.argv[1] == "refresh":
+        logging.basicConfig(level=logging.INFO)
+        refresh_static_cache()
+        sys.exit(0)
+
     df = fetch_outfield_stats()
     print(f"outfield rows: {len(df)} | columns: {len(df.columns)}")
+    csv = _csv_path(DEFAULT_SEASON, gk=False)
+    print(f"loaded from: {csv}   exists={csv.exists()}")
 
     targets = ["Haaland", "Mbappé", "Bellingham", "Vinícius", "Yamal"]
     cols = [

@@ -147,6 +147,16 @@ Open http://localhost:8501 in your browser.
 .venv/bin/python -m model.backtest          # 2018 + 2022 backtest
 ```
 
+### Refresh FBref club stats (only when a new club season ends)
+Last-season club stats are cached as CSVs in `data/fbref_cache/`. The
+deployed app loads these directly — no `soccerdata` / chromedriver
+dependency in production. To rebuild them after a new club season ends:
+```bash
+.venv/bin/python -m data.fbref_stats refresh
+```
+This re-scrapes via soccerdata (takes ~2-3 min, needs Chrome installed
+locally), writes the new CSVs, then `git commit` + `git push` to ship.
+
 ### Update player taker lists between matchdays
 Two JSON files control prior multipliers:
 
@@ -213,9 +223,11 @@ or missing in Streamlit Cloud secrets. Re-paste it, redeploy.
 (typical 7+ days before MD1). The model falls back to stat-only projections;
 nothing's broken.
 
-**"FBref fetch failed"** → FBref intermittently rate-limits the scraper.
-Click **Refresh data** in the sidebar; if that doesn't help, wait 30 minutes
-and try again. The 7-day cache means you'll only hit this on cold-start.
+**"FBref fetch failed"** → Should never happen on the deployed app — last-
+season stats are shipped in the repo at `data/fbref_cache/`. If you see
+this locally, it means the CSVs are missing; run
+`.venv/bin/python -m data.fbref_stats refresh` to rebuild them (needs
+Chrome installed locally).
 
 **The projected score looks wrong** → Tier ranges are calibrated for
 8-matchday WC fantasy, NOT 38-week Premier League fantasy. A point estimate
