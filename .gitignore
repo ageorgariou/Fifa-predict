@@ -19,6 +19,12 @@ env/
 data/cache/
 data/backtest_scatter.png
 
+# Pipeline runtime artifacts (regenerated every refresh)
+data/latest_recommendation.json
+data/news_context.json
+data/refresh_log.jsonl
+data/email_failures.log
+
 # Selenium / chromedriver artifacts (created by soccerdata on first run)
 downloaded_files/
 chromedriver*

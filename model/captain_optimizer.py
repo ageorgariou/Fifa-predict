@@ -55,6 +55,13 @@ SIGMA_RATIO = 0.7                              # σ / mean for the score distrib
 CEILING_OWNERSHIP_MAX = 0.30                   # contrarian if est_ownership < this
 CEILING_EV_THRESHOLD = 0.85                    # candidate EV must be ≥ this × top EV
 
+# Shot-volume tiebreaker (Floor mode):
+# When two candidates' ep_round values fall within this window, prefer the one
+# with the higher shots-on-target per 90. The captain double rewards variance,
+# and high-SoT players have fatter right tails (more 2- and 3-goal hauls). A
+# 0.5-point EV gap is small enough that the variance edge outweighs it.
+TIEBREAK_EV_WINDOW = 0.5
+
 
 def _sample_score(rng: np.random.Generator, ep: float, n_sims: int) -> np.ndarray:
     """Gamma(mean=ep, σ=SIGMA_RATIO·ep), shape inferred from those moments.
@@ -67,6 +74,71 @@ def _sample_score(rng: np.random.Generator, ep: float, n_sims: int) -> np.ndarra
     return rng.gamma(k, theta, size=n_sims)
 
 
+def _load_shot_volume_map() -> dict[str, float]:
+    """Return {player_name: per90_sot} from the FBref outfield cache.
+
+    Used by the floor-mode tiebreaker. Players outside the Big 5 (e.g. Saudi
+    PL, MLS) won't be in this map; the tiebreaker falls back to raw EV for
+    them.
+
+    Failure mode: if FBref cannot be loaded at all (cache missing), returns
+    an empty dict — the tiebreaker is a no-op and the rest of the pipeline
+    keeps working."""
+    try:
+        from data.fbref_stats import fetch_outfield_stats
+        df = fetch_outfield_stats()
+        return {
+            str(p): float(s) for p, s in zip(df["player"], df["per90_sot"])
+            if pd.notna(s)
+        }
+    except Exception as exc:  # noqa: BLE001
+        log.warning("shot-volume tiebreaker unavailable: %s", exc)
+        return {}
+
+
+def _apply_tiebreak(
+    table: pd.DataFrame,
+    primary_name: str,
+    shot_vol: dict[str, float],
+) -> tuple[str, str | None]:
+    """If any candidate within TIEBREAK_EV_WINDOW of `primary_name`'s
+    ep_round has higher per90_sot, return that candidate's name.
+    Returns (chosen_name, tiebreak_note_or_None)."""
+    if not shot_vol:
+        return primary_name, None
+    primary_ep = float(table.loc[table["name"] == primary_name,
+                                   "ep_round"].iloc[0])
+    near = table[
+        (table["ep_round"] >= primary_ep - TIEBREAK_EV_WINDOW)
+        & (table["name"] != primary_name)
+    ]
+    if near.empty:
+        return primary_name, None
+
+    primary_sot = shot_vol.get(primary_name)
+    # If we don't have shot-volume for the leader, we can't tie-break safely.
+    if primary_sot is None:
+        return primary_name, None
+
+    best_name = primary_name
+    best_sot = primary_sot
+    for _, row in near.iterrows():
+        cand = row["name"]
+        sot = shot_vol.get(cand)
+        if sot is None:
+            continue
+        if sot > best_sot:
+            best_name = cand
+            best_sot = sot
+
+    if best_name == primary_name:
+        return primary_name, None
+    note = (f"Shot-volume tiebreaker: {best_name} preferred over "
+            f"{primary_name} (per90 SoT {best_sot:.2f} vs {primary_sot:.2f}, "
+            f"EV gap < {TIEBREAK_EV_WINDOW}).")
+    return best_name, note
+
+
 def optimize_captain(
     xi: pd.DataFrame,
     score_col: str,
@@ -77,8 +149,13 @@ def optimize_captain(
     mode: str = "floor",
     n_sims: int = 10_000,
     seed: int = 42,
+    shot_volume: dict[str, float] | None = None,
 ) -> dict:
-    """See module docstring."""
+    """See module docstring.
+
+    `shot_volume` is an optional {name: per90_sot} dict used by the
+    floor-mode tiebreaker. If None, the tiebreaker auto-loads it from the
+    FBref outfield cache; pass {} to disable."""
     if "name" not in xi.columns or score_col not in xi.columns:
         raise ValueError("xi must have 'name' and score_col columns")
     n_sharp = n_sharp_opponents if n_sharp_opponents is not None else league_size - 1
@@ -160,6 +237,11 @@ def optimize_captain(
     else:  # floor (default)
         primary = table.loc[table["expected_rank_gain"].idxmax(), "name"]
 
+    tiebreak_note: str | None = None
+    if mode != "ceiling":
+        sv = shot_volume if shot_volume is not None else _load_shot_volume_map()
+        primary, tiebreak_note = _apply_tiebreak(table, primary, sv)
+
     primary_row = table[table["name"] == primary].iloc[0]
     others = table[table["name"] != primary]
     vice = others.loc[others["expected_rank_gain"].idxmax(), "name"]
@@ -192,6 +274,9 @@ def optimize_captain(
             f"{primary_row['est_ownership']*100:.0f}% vs {top_own*100:.0f}% owned). "
             f"Expected rank gain: {primary_row['expected_rank_gain']:+.2f}."
         )
+
+    if tiebreak_note:
+        reasoning = f"{reasoning} {tiebreak_note}"
 
     return {
         "primary_captain": primary,

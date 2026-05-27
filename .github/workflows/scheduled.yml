@@ -1,0 +1,146 @@
+name: Scheduled refresh + news + email
+
+# Cron times are UTC. GitHub Actions cron fires with 1-15 minutes of
+# jitter, so we fire slightly earlier than the target time; the scripts
+# themselves verify the actual time-to-deadline before doing real work.
+#
+# Deadlines (UTC) — see model/schedule.py:
+#   MD1: 2026-06-11 16:00     news: 14:00     email: 14:30
+#   MD2: 2026-06-16 16:00     news: 14:00     email: 14:30
+#   MD3: 2026-06-22 16:00     news: 14:00     email: 14:30
+#   MD4: 2026-06-28 16:00     news: 14:00     email: 14:30
+#   MD5: 2026-07-04 16:00     news: 14:00     email: 14:30
+#   MD6: 2026-07-09 16:00     news: 14:00     email: 14:30
+#   MD7: 2026-07-14 16:00     news: 14:00     email: 14:30
+#   MD8: 2026-07-18 16:00     news: 14:00     email: 14:30
+
+on:
+  schedule:
+    # Background data refresh — every 6 hours.
+    - cron: '0 */6 * * *'
+
+    # News digest — T-2h10m before each MD deadline (13:50 UTC on
+    # deadline dates). One cron per matchday, restricted to the date.
+    - cron: '50 13 11 6 *'   # MD1: Jun 11
+    - cron: '50 13 16 6 *'   # MD2: Jun 16
+    - cron: '50 13 22 6 *'   # MD3: Jun 22
+    - cron: '50 13 28 6 *'   # MD4: Jun 28
+    - cron: '50 13 4 7 *'    # MD5: Jul 04
+    - cron: '50 13 9 7 *'    # MD6: Jul 09
+    - cron: '50 13 14 7 *'   # MD7: Jul 14
+    - cron: '50 13 18 7 *'   # MD8: Jul 18
+
+    # Email — T-1h40m before each MD deadline (14:20 UTC).
+    - cron: '20 14 11 6 *'   # MD1
+    - cron: '20 14 16 6 *'   # MD2
+    - cron: '20 14 22 6 *'   # MD3
+    - cron: '20 14 28 6 *'   # MD4
+    - cron: '20 14 4 7 *'    # MD5
+    - cron: '20 14 9 7 *'    # MD6
+    - cron: '20 14 14 7 *'   # MD7
+    - cron: '20 14 18 7 *'   # MD8
+
+  # Manual trigger — useful for the end-to-end verification step.
+  workflow_dispatch:
+    inputs:
+      job:
+        description: 'Which job to run'
+        type: choice
+        options: [refresh, news, email, all]
+        default: refresh
+      matchday:
+        description: 'Matchday to target (1-8, blank = auto)'
+        required: false
+
+jobs:
+  refresh:
+    runs-on: ubuntu-latest
+    # Run on every cron firing (refresh is idempotent + cheap-ish) plus
+    # manual dispatches that select refresh or all.
+    if: ${{ github.event_name == 'schedule' || github.event.inputs.job == 'refresh' || github.event.inputs.job == 'all' }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Run refresh pipeline
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+          ODDS_API_KEY: ${{ secrets.ODDS_API_KEY }}
+        run: |
+          if [ -n "${{ github.event.inputs.matchday }}" ]; then
+            python -m scripts.refresh_pipeline --md ${{ github.event.inputs.matchday }}
+          else
+            python -m scripts.refresh_pipeline
+          fi
+      - name: Upload snapshot artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: latest_recommendation
+          path: |
+            data/latest_recommendation.json
+            data/refresh_log.jsonl
+
+  news:
+    runs-on: ubuntu-latest
+    needs: refresh
+    # Only run on a deadline-day cron, or explicit dispatch.
+    if: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'news' || github.event.inputs.job == 'all')) || (github.event_name == 'schedule' && startsWith(github.event.schedule, '50 13')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Download latest snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: latest_recommendation
+          path: data/
+      - name: Scrape news
+        run: python -m scripts.news_digest
+      - name: Upload news artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: news_context
+          path: data/news_context.json
+
+  email:
+    runs-on: ubuntu-latest
+    needs: [refresh, news]
+    if: ${{ (github.event_name == 'workflow_dispatch' && (github.event.inputs.job == 'email' || github.event.inputs.job == 'all')) || (github.event_name == 'schedule' && startsWith(github.event.schedule, '20 14')) }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+      - name: Install deps
+        run: pip install -r requirements.txt
+      - name: Download latest snapshot
+        uses: actions/download-artifact@v4
+        with:
+          name: latest_recommendation
+          path: data/
+      - name: Download news context
+        continue-on-error: true   # OK if news job didn't produce output
+        uses: actions/download-artifact@v4
+        with:
+          name: news_context
+          path: data/
+      - name: Send email
+        env:
+          EMAIL_FROM: ${{ secrets.EMAIL_FROM }}
+          EMAIL_PASSWORD: ${{ secrets.EMAIL_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+        run: |
+          if [ -n "${{ github.event.inputs.matchday }}" ]; then
+            python -m scripts.email_picks --md ${{ github.event.inputs.matchday }}
+          else
+            python -m scripts.email_picks
+          fi

@@ -1,10 +1,19 @@
 """Streamlit UI for the WC Fantasy Advisor.
 
 Run locally:  .venv/bin/streamlit run app.py
+
+Primary flow (post-automation upgrade)
+--------------------------------------
+On page load, the app reads `data/latest_recommendation.json` written by
+`scripts/refresh_pipeline.py` (which runs every 6h via GitHub Actions).
+The "Regenerate now" button forces a fresh run — useful right before the
+deadline after pasting injury news.
 """
 from __future__ import annotations
 
-from datetime import date
+import json
+from datetime import date, datetime, timezone
+from pathlib import Path
 from typing import Any
 
 import matplotlib.patches as mpatches
@@ -13,7 +22,7 @@ import pandas as pd
 import streamlit as st
 
 from advisor.claude_client import get_advice
-from config import NATION_CAP
+from config import DATA_DIR, NATION_CAP
 from data.cache import cache_age
 from data.cache import clear as clear_cache_db
 from data.fifa_players import fetch_player_list
@@ -25,6 +34,8 @@ from model.score_estimate import (
     CONFIDENCE_BAND, GLOBAL_TIERS, OFFICE_TIERS, _place_in_tiers,
 )
 from model.tournament_sim import simulate
+
+LATEST_JSON = DATA_DIR / "latest_recommendation.json"
 
 # ---------------------------------------------------------------------------
 # Matchday calendar (auto-detect)
@@ -78,6 +89,73 @@ def cached_squad(stage: str) -> pd.DataFrame:
 @st.cache_data(show_spinner=False, ttl=60 * 60)
 def cached_fifa() -> pd.DataFrame:
     return fetch_player_list()
+
+
+# ---------------------------------------------------------------------------
+# Snapshot loader (background refresh writes to data/latest_recommendation.json)
+# ---------------------------------------------------------------------------
+def load_snapshot() -> dict | None:
+    if not LATEST_JSON.exists():
+        return None
+    try:
+        return json.loads(LATEST_JSON.read_text())
+    except Exception:  # noqa: BLE001 — UI must keep working even if snapshot is corrupt
+        return None
+
+
+def snapshot_to_results(snap: dict) -> dict[str, Any]:
+    """Reconstruct the `results` dict shape that the render path below
+    expects, from a JSON snapshot written by refresh_pipeline.py."""
+    squad = pd.DataFrame(snap["squad"])
+    xi = pd.DataFrame(snap["xi"])
+    bench = pd.DataFrame(snap["bench"])
+    differentials = pd.DataFrame(snap["differentials"])
+    formation = tuple(snap["formation"])
+
+    matchday = snap["matchday"]
+    md_col = f"ev_md{matchday}"
+    xi_score = float(xi[md_col].sum()) if not xi.empty else 0.0
+    primary = snap["captain_rec"]["primary_captain"]
+    capt_rows = xi[xi["name"] == primary]
+    captain_bonus = float(capt_rows[md_col].iloc[0]) if not capt_rows.empty else 0.0
+
+    point_estimate = float(snap["point_estimate"])
+    ci_lo = point_estimate * (1 - CONFIDENCE_BAND)
+    ci_hi = point_estimate * (1 + CONFIDENCE_BAND)
+
+    advice_dict = snap.get("advice")
+    advice_obj = None
+    if advice_dict is not None:
+        from advisor.schemas import Advice
+        try:
+            advice_obj = Advice(**advice_dict)
+        except Exception:  # noqa: BLE001
+            advice_obj = None
+
+    return {
+        "matchday": matchday,
+        "stage": snap["stage"],
+        "squad": squad,
+        "xi": xi,
+        "formation": formation,
+        "bench": bench,
+        "captain_rec": snap["captain_rec"],
+        "differentials": differentials,
+        "md_predicted": xi_score + captain_bonus,
+        "xi_score": xi_score,
+        "captain_bonus": captain_bonus,
+        "point_estimate": point_estimate,
+        "ci_lo": ci_lo,
+        "ci_hi": ci_hi,
+        "office_tier": _place_in_tiers(point_estimate, OFFICE_TIERS),
+        "global_tier": _place_in_tiers(point_estimate, GLOBAL_TIERS),
+        "md_breakdown": pd.DataFrame(snap["md_breakdown"]),
+        "chip_plan": snap.get("chip_plan", []),
+        "data_sources": snap.get("data_sources", {}),
+        "generated_at": snap.get("generated_at"),
+        "advice": advice_obj,
+        "advice_error": None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -361,9 +439,32 @@ with st.sidebar:
             "(~5 days before MD1)."
         )
 
+# === Auto-load cached snapshot on page open ===
+if "results" not in st.session_state:
+    snap = load_snapshot()
+    if snap is not None and int(snap.get("matchday", 0)) == int(matchday):
+        st.session_state.results = snapshot_to_results(snap)
+
+if st.session_state.get("results") and st.session_state["results"].get("generated_at"):
+    try:
+        gen_ts = datetime.fromisoformat(
+            st.session_state["results"]["generated_at"].replace("Z", "+00:00")
+        )
+        age_min = (datetime.now(timezone.utc) - gen_ts).total_seconds() / 60.0
+        st.caption(
+            f"Loaded cached recommendation generated "
+            f"{age_min:.0f} min ago. Click **Regenerate now** below if you "
+            f"pasted new news."
+        )
+    except Exception:  # noqa: BLE001
+        pass
+
 # === Main run button ===
-run_clicked = st.button("Get this round's picks", type="primary",
-                        use_container_width=True)
+run_clicked = st.button("Regenerate now", type="primary",
+                        use_container_width=True,
+                        help="Re-runs the full pipeline using the news you pasted "
+                             "in the sidebar. Otherwise the app uses the cached "
+                             "snapshot refreshed every 6h in the background.")
 
 if run_clicked:
     with st.spinner("Thinking…"):
@@ -494,12 +595,34 @@ if results:
     if advice and advice.chip_recommendation:
         st.info(f"**Chip recommendation:** {advice.chip_recommendation}")
 
-    # --- 7. Per-MD projection breakdown (debug-y but useful) ---
+    # --- 7. Chip strategy timeline ---
+    chip_plan = results.get("chip_plan", [])
+    if chip_plan:
+        with st.expander("Chip strategy timeline", expanded=False):
+            st.markdown(
+                "Greedy chip plan across the remaining matchdays. "
+                "Higher **expected lift** = bigger projected fantasy-point gain "
+                "from playing the chip that round."
+            )
+            chip_df = pd.DataFrame([
+                {
+                    "Matchday": (f"MD{p['matchday']}" if p["matchday"]
+                                 else "— (hold)"),
+                    "Chip": p["chip"],
+                    "Lift (pts)": p["expected_lift"],
+                    "Reasoning": p["reasoning"],
+                }
+                for p in chip_plan
+            ])
+            st.dataframe(chip_df, hide_index=True, use_container_width=True)
+
+    # --- 8. Per-MD projection breakdown (debug-y but useful) ---
     with st.expander("Per-matchday breakdown"):
         st.dataframe(results["md_breakdown"], hide_index=True, use_container_width=True)
 else:
     st.info(
-        "Set your sidebar options, then click **Get this round's picks** above. "
-        "First run takes 1-3 minutes while we pull stats and run 10,000 "
-        "tournament simulations; subsequent runs use cache and complete in seconds."
+        "No cached recommendation yet — click **Regenerate now** above to run "
+        "the full pipeline (1-3 minutes the first time, seconds thereafter). "
+        "In production, `scripts/refresh_pipeline.py` writes a fresh snapshot "
+        "every 6h so this page loads instantly."
     )

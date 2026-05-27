@@ -103,6 +103,7 @@ def _build_user_prompt(
     differentials: pd.DataFrame,
     user_news: str,
     opponent_captains: list[str] | None,
+    chip_plan: list[dict] | None = None,
 ) -> str:
     fmt_str = f"{formation[1]}-{formation[2]}-{formation[3]}"
     md_col = f"ev_md{matchday}"
@@ -132,6 +133,17 @@ def _build_user_prompt(
     opp = ", ".join(opponent_captains) if opponent_captains else "(none provided)"
     chips_str = ", ".join(chips_remaining) if chips_remaining else "(none)"
 
+    chip_plan_lines = "(none)"
+    if chip_plan:
+        rows = []
+        for p in chip_plan:
+            md = f"MD{p['matchday']}" if p.get("matchday") else "hold"
+            rows.append(
+                f"  {md}: {p['chip']} (lift +{p['expected_lift']:.1f}) — "
+                f"{p['reasoning']}"
+            )
+        chip_plan_lines = "\n".join(rows)
+
     return f"""\
 TOURNAMENT CONTEXT
 - Matchday: MD{matchday} ({stage})
@@ -139,6 +151,9 @@ TOURNAMENT CONTEXT
 - League size: {league_size}
 - Free transfers available: {free_transfers}
 - Chips remaining: {chips_str}
+
+PROJECTED CHIP PLAN (greedy, full remaining timeline):
+{chip_plan_lines}
 
 LP-OPTIMAL 15-MAN SQUAD (sorted by tournament EV):
 {squad_lines}
@@ -189,6 +204,7 @@ def get_advice(
     differentials: pd.DataFrame,
     user_news: str = "",
     opponent_captains: list[str] | None = None,
+    chip_plan: list[dict] | None = None,
     max_tokens: int = 4096,
 ) -> Advice:
     """Make one Claude call and parse the structured response. Retries once
@@ -206,6 +222,7 @@ def get_advice(
         squad=squad, xi=xi, formation=formation, bench=bench,
         captain_rec=captain_rec, differentials=differentials,
         user_news=user_news, opponent_captains=opponent_captains,
+        chip_plan=chip_plan,
     )
 
     messages: list[dict] = [{"role": "user", "content": user_prompt}]
