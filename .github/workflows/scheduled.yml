@@ -16,8 +16,20 @@ name: Scheduled refresh + news + email
 
 on:
   schedule:
-    # Background data refresh — every 6 hours.
-    - cron: '0 */6 * * *'
+    # Background data refresh.
+    #
+    # Pre-tournament (now → Jun 9): once/day at 06:00 UTC. The only thing
+    # that drifts pre-tournament is FIFA ownership %, which moves slowly;
+    # the rest (Elo, club stats) is static. Cuts Actions minutes + API
+    # spend by ~75% vs the every-6h cadence below.
+    - cron: '0 6 28-31 5 *'   # May 28–31 (workflow lands May 27, starts next day)
+    - cron: '0 6 1-9 6 *'     # Jun 1–9
+    #
+    # Tournament window (Jun 10 → Jul 19): every 6 hours. Live ownership,
+    # goalscorer odds, news, and elimination updates all move during the
+    # tournament, so we need the higher cadence.
+    - cron: '0 */6 10-30 6 *' # Jun 10–30
+    - cron: '0 */6 1-19 7 *'  # Jul 1–19
 
     # News digest — T-2h10m before each MD deadline (13:50 UTC on
     # deadline dates). One cron per matchday, restricted to the date.
